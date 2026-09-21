@@ -1,0 +1,31 @@
+[package]
+name = "sc2_replay_analyser"
+version = "0.1.0"
+edition = "2024"
+
+# Keep the binary name stable so existing scripts keep working
+# (e.g. scripts/test-matrix.sh expects target/release/replay_analyzer).
+[[bin]]
+name = "replay_analyzer"
+path = "src/main.rs"
+
+[dependencies]
+protobuf = { version = "2.8.2", features = ["with-bytes"] }
+sc2-proto = { git = "https://github.com/swiftcoder/sc2-proto-rs.git" }
+tungstenite = "0.28.0"
+anyhow = "1.0"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tracing-logfmt = "0.3"
+dirs = "6.0.0"
+nom-mpq = "2.0.6"
+thiserror = "2.0"
+
+[patch.crates-io]
+sc2-proto = { git = "https://github.com/swiftcoder/sc2-proto-rs.git" }
+
+[target.'cfg(windows)'.dependencies]
+regex = "^1.12"
