@@ -80,6 +80,29 @@ struct Args {
     #[arg(long)]
     container_launch: Option<String>,
 
+    /// Host path to alignmutex.so (Apple Silicon Rosetta fix).
+    /// Mounted read-only into the SC2 container and set as LD_PRELOAD so
+    /// SC2's misaligned mutexes don't crash at map load under Rosetta.
+    /// When omitted and the Rosetta workarounds are on (the default on
+    /// macOS/ARM), `apple-silicon/alignmutex.so` is used automatically when
+    /// that file exists (build it with ./apple-silicon/build.sh).
+    #[arg(long)]
+    alignmutex_so: Option<PathBuf>,
+
+    /// Force-enable the Rosetta workarounds for the dockerised SC2 client
+    /// (argv padding + automatic alignmutex.so). They default on for
+    /// macOS/ARM, so this is only needed to opt in elsewhere.
+    #[arg(long, conflicts_with = "no_rosetta")]
+    rosetta: bool,
+
+    /// Force-disable the Rosetta workarounds (argv padding and the automatic
+    /// alignmutex.so). Pass this when running macOS/ARM containers under
+    /// QEMU instead of Rosetta (Rosetta disabled in the VM), where the stock
+    /// command line is correct and the padding would break parsing instead.
+    /// An explicit --alignmutex-so is still honoured.
+    #[arg(long, conflicts_with = "rosetta")]
+    no_rosetta: bool,
+
     /// Connect to an already-running SC2 client instead of launching docker.
     #[arg(long)]
     no_docker: bool,
@@ -108,6 +131,20 @@ struct Args {
     /// Engagements: minimum combat supply on each side to start an engagement.
     #[arg(long, default_value_t = 6.0)]
     engagement_min_supply: f32,
+}
+
+/// Rosetta workarounds default on for macOS/ARM: Docker runs x86 containers
+/// under emulation there, and Rosetta is the fast path worth defaulting to.
+/// (QEMU users must pass --no-rosetta: the argv padding breaks parsing when
+/// /proc/self/cmdline is intact.)
+fn default_rosetta() -> bool {
+    cfg!(target_os = "macos") && cfg!(target_arch = "aarch64")
+}
+
+/// Default host path for the alignmutex preload library, used when the user
+/// didn't pass --alignmutex-so explicitly.
+fn default_alignmutex_so() -> PathBuf {
+    PathBuf::from("apple-silicon/alignmutex.so")
 }
 
 /// OS-specific default for `--maps-dir`.
@@ -153,6 +190,26 @@ fn main() -> Result<()> {
 
     let host_port = args.host_port.unwrap_or_else(|| crate::sc2::get_unused_port() as u16);
 
+    // Rosetta workarounds: default on for macOS/ARM, force-off with
+    // --no-rosetta (QEMU), force-on elsewhere with --rosetta.
+    let rosetta = if args.no_rosetta {
+        false
+    } else {
+        args.rosetta || default_rosetta()
+    };
+    // Preload library: explicit path wins; otherwise auto-use the default
+    // build output when the workarounds are on and it exists.
+    let alignmutex_so = args.alignmutex_so.clone().or_else(|| {
+        if rosetta && default_alignmutex_so().is_file() {
+            Some(default_alignmutex_so())
+        } else {
+            None
+        }
+    });
+    if rosetta {
+        tracing::info!("Rosetta workarounds enabled");
+    }
+
     let docker_config = crate::sc2::docker::DockerConfig {
         image: args.docker_image.clone(),
         maps_dir: maps_dir.clone(),
@@ -168,7 +225,10 @@ fn main() -> Result<()> {
             .as_ref()
             .and_then(|m| m.data_version.clone()),
         host_network: false,
-        extra_ports: vec![],};
+        extra_ports: vec![],
+        alignmutex_host_path: alignmutex_so.clone(),
+        rosetta_argv_workaround: rosetta,
+    };
 
     let _local_sc2 = if args.local_sc2 {
         let sc2_path = crate::sc2::get_path_to_sc2();
@@ -208,6 +268,19 @@ fn main() -> Result<()> {
     } else {
         None
     };
+
+    if (alignmutex_so.is_some() || rosetta || args.no_rosetta)
+        && (args.local_sc2 || args.no_docker)
+    {
+        tracing::warn!(
+            "--alignmutex-so/--rosetta/--no-rosetta only apply to the dockerised SC2 client; ignoring them for local/existing client"
+        );
+    }
+    if rosetta && alignmutex_so.is_none() && !args.local_sc2 && !args.no_docker {
+        tracing::warn!(
+            "Rosetta workarounds on but no alignmutex.so found (build it with ./apple-silicon/build.sh or pass --alignmutex-so); SC2 will likely crash at map load"
+        );
+    }
 
     let replay_arg = if args.local_sc2 || args.no_docker {
         replay_path.display().to_string()

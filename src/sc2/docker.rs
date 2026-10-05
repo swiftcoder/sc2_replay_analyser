@@ -23,6 +23,10 @@ pub const DEFAULT_CONTAINER_SC2_PATH: &str = "/root/StarCraftII";
 /// Default container path where the host maps dir is mounted.
 pub const DEFAULT_CONTAINER_MAPS_DIR: &str = "/root/StarCraftII/maps";
 
+/// Container path the alignmutex LD_PRELOAD library is mounted at when the
+/// Apple Silicon Rosetta fix is enabled (see apple-silicon/alignmutex.c).
+pub const CONTAINER_ALIGNMUTEX_PATH: &str = "/opt/alignmutex.so";
+
 #[derive(Clone)]
 pub struct DockerConfig {
     /// Docker image containing the Linux SC2 client.
@@ -54,6 +58,21 @@ pub struct DockerConfig {
     /// Extra host->container port mappings for SC2 peer ports (5002-5005).
     /// Only used when host_network is false.
     pub extra_ports: Vec<u16>,
+    /// Host path to a prebuilt alignmutex.so (Apple Silicon Rosetta fix).
+    /// When set, the file is mounted read-only at CONTAINER_ALIGNMUTEX_PATH
+    /// and LD_PRELOAD is pointed at it so SC2's misaligned pthread mutexes
+    /// are routed to aligned shadows. None = stock behaviour (QEMU-safe).
+    pub alignmutex_host_path: Option<PathBuf>,
+    /// Duplicate the SC2 exe path as a sacrificial first argument.
+    /// OrbStack's Rosetta drops argv[0] from /proc/self/cmdline, which SC2
+    /// parses as its command line (treating the first entry as the program
+    /// name). Without this SC2 skips "-listen" and dies at startup with
+    /// "Missing -listen command line" + signal 11. Only needed under
+    /// Rosetta setups with this cmdline bug (observed on OrbStack; the
+    /// colima setup in aiarena/local-play-bootstrap#22 reaches map load
+    /// without it). Must be false under QEMU, where cmdline is intact and
+    /// the extra arg would break parsing instead.
+    pub rosetta_argv_workaround: bool,
 }
 
 impl DockerConfig {
@@ -105,11 +124,20 @@ fn default_launch(config: &DockerConfig) -> String {
     // binary, headless (no X server required), data dir pointed at the
     // StarCraft II install. The listen address embeds the port
     // (`0.0.0.0:<port>`) because this SC2 build reliably parses that form.
+    // With rosetta_argv_workaround the exe path is repeated as a sacrificial
+    // argv[1]: Rosetta drops argv[0] from /proc/self/cmdline (which SC2
+    // parses, skipping entry 0 as the program name), so without padding SC2
+    // never sees "-listen".
+    let exe_arg = if config.rosetta_argv_workaround {
+        "\"$D/SC2_x64\" "
+    } else {
+        ""
+    };
     format!(
         "D=; if [ -n \"{base_dir}\" ] && [ -d {sc2}/Versions/{base_dir} ]; then D={sc2}/Versions/{base_dir}; fi; \
          [ -z \"$D\" ] && D=$(ls -d {sc2}/Versions/Base* 2>/dev/null | sort -V | tail -1); \
          mkdir -p /tmp/sc2-game; cd {sc2}; \
-         exec \"$D/SC2_x64\" -listen 0.0.0.0:{port} -dataDir {sc2} -displayMode 0 -tempDir /tmp/sc2-game {data_version_arg}",
+         exec \"$D/SC2_x64\" {exe_arg}-listen 0.0.0.0:{port} -dataDir {sc2} -displayMode 0 -tempDir /tmp/sc2-game {data_version_arg}",
     )
 }
 
@@ -183,6 +211,34 @@ impl DockerSc2 {
                     replay_dir.display(),
                     dir.trim_end_matches('/')
                 ));
+        }
+
+        // Apple Silicon Rosetta fix: preload alignmutex.so into the SC2
+        // container so misaligned pthread mutexes don't SIGBUS under Rosetta.
+        // Mirrors docker-compose-apple-silicon.yml from
+        // aiarena/local-play-bootstrap#22 (LD_PRELOAD + read-only mount),
+        // adapted to `docker run` since this tool doesn't use compose.
+        if let Some(so_path) = &config.alignmutex_host_path {
+            let abs = std::fs::canonicalize(so_path).with_context(|| {
+                format!("resolving --alignmutex-so {}", so_path.display())
+            })?;
+            if !abs.is_file() {
+                bail!("--alignmutex-so is not a file: {}", abs.display());
+            }
+            cmd.args(["-v"]).arg(format!(
+                "{}:{}:ro",
+                abs.display(),
+                CONTAINER_ALIGNMUTEX_PATH
+            ));
+            cmd.args(["-e"]).arg(format!(
+                "LD_PRELOAD={}",
+                CONTAINER_ALIGNMUTEX_PATH
+            ));
+            tracing::info!(
+                host_path = %abs.display(),
+                container_path = CONTAINER_ALIGNMUTEX_PATH,
+                "preloading alignmutex.so into SC2 container (Rosetta fix)"
+            );
         }
 
         cmd.args(["--entrypoint", "/bin/bash"])

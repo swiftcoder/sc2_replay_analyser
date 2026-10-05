@@ -7,9 +7,59 @@ We play the StarCraft II replay back through the dockerised Linux SC2 client, an
 ## Prerequisites
 
 - Docker (the analyser launches a Linux SC2 client container).
-  - On an ARM Mac, you'll need to disable rosetta emulation in your docker client
 - The map the replay was played on, available to the container. On macOS the
   ladder maps are pulled from `/Applications/StarCraft II/Maps`.
+
+## Apple Silicon (M1/M2/M3/M4) Macs
+
+The images are x86-64, so Docker runs them under emulation: slow QEMU by
+default, or Apple's much faster Rosetta when it is enabled. Rosetta is
+several times faster, but StarCraft II 4.10 crashes under it while loading
+the map (both players `SC2Crash` at 0 game loops). The cause is SC2 itself:
+it keeps some pthread mutexes at 2-byte-aligned addresses, and Rosetta's
+translated ARM atomics SIGBUS on the `lock cmpxchg` when the operand crosses
+a 16-byte boundary.
+
+The small preload library in [`apple-silicon/`](apple-silicon/alignmutex.c)
+(ported from
+[aiarena/local-play-bootstrap#22](https://github.com/aiarena/local-play-bootstrap/pull/22))
+routes each misaligned mutex to an aligned shadow mutex. Aligned mutexes
+pass straight through, so it is a no-op elsewhere. On other platforms the
+default run is unchanged.
+
+To run replays with acceleration (the default on macOS/ARM):
+
+1. Enable Rosetta for x86-64 containers:
+   - **OrbStack:** Settings → Rosetta x86 emulation (or `orbctl config set rosetta true`).
+   - **Docker Desktop:** Settings → General → "Use Rosetta for x86_64/amd64 emulation on Apple Silicon".
+   - **colima:** `colima start --vm-type vz --vz-rosetta`.
+2. Build the library once (needs only Docker): `./apple-silicon/build.sh`
+3. Just run:
+   `cargo run -- --replay <...> --maps-dir "<...>"`
+
+   On macOS/ARM the Rosetta workarounds are on by default: the `--rosetta`
+   argv padding is applied, and `apple-silicon/alignmutex.so` is preloaded
+   automatically when present.
+
+To run under QEMU instead (Rosetta disabled in the VM), opt back out with
+`--no-rosetta` — the stock command line is correct there, and the padding
+would break parsing instead. (An explicit `--alignmutex-so` is still
+honoured under `--no-rosetta`, but it is unnecessary under QEMU.)
+
+The argv padding duplicates the SC2 exe path as a sacrificial first argument.
+It is needed on OrbStack, whose Rosetta drops argv[0] from
+`/proc/self/cmdline` — and SC2 parses that file (not argv) as its command
+line, skipping the first entry as the program name. Without it SC2 never
+sees `-listen` and dies at startup (`Missing -listen command line`, then
+signal 11). The colima setup from
+[aiarena/local-play-bootstrap#22](https://github.com/aiarena/local-play-bootstrap/pull/22)
+reaches map load without this workaround, so it appears OrbStack-specific;
+Docker Desktop is untested — if startup fails there, try `--no-rosetta`
+(and report back).
+
+Upstream test results for the same library: Rosetta without it crashes at
+map load; with it the test match completed (~2,100 game loops in ~25 s),
+and games ran 3.7–9× faster than under QEMU.
 
 ## Running
 
@@ -34,6 +84,9 @@ Useful flags:
 | `--sample-loops` | `22` | game loops per observation (22 = 1 game second) |
 | `--output-dir` | `output/analysis/<replay-stem>` | where the three files are written |
 | `--no-docker` | off | connect to an already-running SC2 client instead of docker |
+| `--alignmutex-so` | auto (`apple-silicon/alignmutex.so` when present) | explicit host path to the preload library (overrides the default) |
+| `--rosetta` | on on macOS/ARM, off elsewhere | force-enable the Rosetta workarounds (argv padding + automatic alignmutex) |
+| `--no-rosetta` | off | force-disable the Rosetta workarounds (use with QEMU) |
 | `--cluster-radius` / `--confront-radius` / `--engagement-radius` / `--engagement-min-supply` | 12 / 20 / 14 / 6 | clustering + engagement tuning |
 
 The analyser prints progress every 60 frames and, when done, the paths of the
