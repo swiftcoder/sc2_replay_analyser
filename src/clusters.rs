@@ -361,7 +361,14 @@ impl EngagementTracker {
         }
 
         // Match each component to an active engagement by unit-tag overlap.
-        let mut matched = vec![false; self.active.len()];
+        //
+        // `existing_active` is captured before the loop: an unmatched component
+        // pushes a *new* engagement below, which makes `self.active` longer than
+        // `matched`, and a later component can then match one of those new
+        // entries (`matched[i]` with `i >= matched.len()` indexed out of bounds
+        // on 2026-11-02, len 2 index 2).
+        let existing_active = self.active.len();
+        let mut matched = vec![false; existing_active];
 
         for comp in &components {
             let comp_tags = comp.tags(clusters);
@@ -399,7 +406,11 @@ impl EngagementTracker {
             }
 
             if let Some((i, _)) = best {
-                matched[i] = true;
+                // `i` may point at an engagement created earlier in this same
+                // tick, which has no `matched` slot; it is matched for free.
+                if let Some(m) = matched.get_mut(i) {
+                    *m = true;
+                }
                 let active = &mut self.active[i];
                 active.last_tick = tick;
                 active.stale_ticks = 0;
@@ -514,7 +525,9 @@ impl EngagementTracker {
         // End stale engagements. Base assaults get hysteresis: they stay alive
         // while their army is still near the base, even if the cluster briefly
         // drifts out of the detection radius.
-        let existing_active = matched.len();
+        //
+        // Only the engagements that existed before this tick can be stale; the
+        // ones appended above started on this tick.
         let mut i = 0;
         while i < self.active.len() {
             let is_stale = {
